@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XIAO x Gemini Motion Analysis</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; background: #f0f2f5; color: #333; }
+        .card { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+        #live-monitor { background: #222; color: #0f0; font-family: monospace; padding: 15px; border-radius: 8px; margin: 15px 0; text-align: left; }
+        .axis-label { color: #888; }
+        button { background: #1a73e8; color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin: 5px 0; }
+        button:disabled { background: #ccc; }
+        input[type="password"] { width: 90%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
+        #progress-container { width: 100%; background: #eee; border-radius: 10px; margin: 15px 0; display: none; }
+        #progress-bar { width: 0%; height: 15px; background: #34a853; border-radius: 10px; transition: width 0.1s linear; }
+        #response { margin-top: 20px; white-space: pre-wrap; text-align: left; border-top: 1px solid #eee; padding-top: 15px; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>Xiao nRF52840 Sense x Gemini<br>Motion Analysis</h2>
+    
+    <input type="password" id="api-key" placeholder="Gemini API Keyを入力してください">
+    
+    <div id="live-monitor">
+        <div><span class="axis-label">X:</span> <span id="valX">0.00</span></div>
+        <div><span class="axis-label">Y:</span> <span id="valY">0.00</span></div>
+        <div><span class="axis-label">Z:</span> <span id="valZ">0.00</span></div>
+    </div>
+
+    <button id="connect-btn" onclick="connectBLE()">1. XIAOに接続する</button>
+    <button id="sampling-btn" onclick="startSampling()" style="background:#34a853; display:none;">2. 10秒間の動きを分析</button>
+
+    <div id="progress-container">
+        <div style="font-size: 0.8em; margin-bottom: 5px;">動きを記録中...</div>
+        <div id="progress-bar"></div>
+    </div>
+
+    <div id="status">ステータス: 未接続</div>
+    <div id="response"></div>
+</div>
+
+<script>
+    let isSampling = false;
+    let dataLog = [];
+    let characteristic;
+
+    window.onload = () => {
+        if (!navigator.bluetooth) {
+            document.getElementById('status').innerHTML = 
+                '<b style="color:red;">お使いのブラウザはBluetoothに対応していません。ChromeかEdgeをお試しください。</b>';
+            document.getElementById('connect-btn').disabled = true;
+        }
+        
+        // Restore saved API key from sessionStorage (cleared when tab is closed)
+        const savedKey = sessionStorage.getItem('gemini_api_key');
+        if (savedKey) document.getElementById('api-key').value = savedKey;
+    };
+
+    async function connectBLE() {
+        try {
+            const device = await navigator.bluetooth.requestDevice({
+                filters: [{ 
+                    name: "XIAO-Gemini-Motion",
+                    services: ['2a41d33a-02d7-4daf-b78b-361dd670abe5']
+                }]
+            });
+            const server = await device.gatt.connect();
+            const service = await server.getPrimaryService('2a41d33a-02d7-4daf-b78b-361dd670abe5');
+            characteristic = await service.getCharacteristic('d6632d94-d2d3-45a2-9a88-e98fe270e4ca');
+
+            await characteristic.startNotifications();
+            characteristic.addEventListener('characteristicvaluechanged', handleNotifications);
+
+            device.addEventListener('gattserverdisconnected', () => {
+                document.getElementById('status').innerText = "ステータス: 切断されました";
+                document.getElementById('connect-btn').style.display = "block";
+                document.getElementById('sampling-btn').style.display = "none";
+                isSampling = false;
+            });
+
+            document.getElementById('status').innerText = "ステータス: 接続成功！";
+            document.getElementById('connect-btn').style.display = "none";
+            document.getElementById('sampling-btn').style.display = "block";
+        } catch (err) {
+            alert("Connection error: " + err);
+        }
+    }
+
+    function handleNotifications(e) {
+        let rawValue = new TextDecoder().decode(e.target.value);
+        let parts = rawValue.split(',');
+        let cleanParts = parts.map(p => {
+            let s = p.replace(/[^-0-9.]/g, '');
+            let dots = s.split('.');
+            if (dots.length > 2) s = dots[0] + '.' + dots.slice(1).join('');
+            if (s.endsWith('.')) s = s.slice(0, -1);
+            return s;
+        }).filter(p => p.length > 0);
+
+        if (cleanParts.length === 3) {
+            document.getElementById('valX').innerText = cleanParts[0];
+            document.getElementById('valY').innerText = cleanParts[1];
+            document.getElementById('valZ').innerText = cleanParts[2];
+
+            if (isSampling) {
+                dataLog.push(`[${cleanParts.join(',')}]`);
+            }
+        }
+    }
+
+    async function startSampling() {
+        const apiKey = document.getElementById('api-key').value;
+        if (!apiKey) { alert("API Keyを入力してください"); return; }
+        // Save API key to sessionStorage (cleared when tab is closed)
+        sessionStorage.setItem('gemini_api_key', apiKey);
+
+        isSampling = true;
+        dataLog = [];
+        const btn = document.getElementById('sampling-btn');
+        const container = document.getElementById('progress-container');
+        const bar = document.getElementById('progress-bar');
+        
+        btn.disabled = true;
+        container.style.display = 'block';
+        bar.style.width = '0%';
+        
+        // 100 * 100ms = 10 seconds
+        let timeLeft = 100;
+        const interval = setInterval(() => {
+            timeLeft -= 1;
+            bar.style.width = (100 - timeLeft) + "%";
+            if (timeLeft <= 0) {
+                clearInterval(interval);
+                isSampling = false;
+                container.style.display = 'none';
+                btn.disabled = false;
+                askGemini(apiKey);
+            }
+        }, 100);
+    }
+
+    async function askGemini(apiKey) {
+        const respDiv = document.getElementById('response');
+        respDiv.innerText = "Gemini解析中...";
+
+        const prompt = {
+            contents: [{
+                parts: [{ text: `以下の加速度データ(x,y,z)の連続記録から、私の動きの特徴（例：円を描いた、激しく振った、静止していた等）を300文字以内でユニークに分析して。データ：${dataLog.join(", ")}` }]
+            }]
+        };
+
+        try {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(prompt)
+            });
+            const json = await res.json();
+
+            if (!res.ok || json.error) {
+                const errorMessage = json.error ? json.error.message : `HTTPエラー: ${res.status}`;
+                throw new Error(`API error: ${errorMessage}`);
+            }
+
+            if (!json.candidates || json.candidates.length === 0) {
+                throw new Error("分析結果を取得できませんでした（データが空です）。");
+            }
+
+            const text = json.candidates[0].content.parts[0].text;
+            respDiv.innerText = "【Geminiの分析】\n" + text;
+            
+        } catch (err) {
+            respDiv.innerText = "エラーが発生しました: \n" + err.message;
+            console.error("Gemini API Error:", err);
+        }
+    }
+</script>
+
+</body>
+</html>
